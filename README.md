@@ -56,7 +56,7 @@ sudo pip3 install -r requirements.txt
 ```shell
 # Windows
 python -m venv venv         # 使用虚拟环境
-. venv/bin/activate         # 激活虚拟环境
+. venv\Scripts\Activate.ps1         # 激活虚拟环境
 pip install -r requirements.txt
 
 # 有问题可参考 https://www.liaoxuefeng.com/wiki/1016959663602400/1017493741106496
