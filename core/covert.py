@@ -1,9 +1,10 @@
 import json
 import logging
 import os
+import re
 import xml.etree.ElementTree as ET
-from typing import Tuple
 from datetime import datetime
+from typing import Tuple
 
 MARKDOWN_SUFFIX = ".md"
 
@@ -14,17 +15,101 @@ class XmlElementConvert(object):
     """
 
     @staticmethod
+    def parse_element_rich_text(element) -> str:
+        """
+        深度解析 XML 节点中的富文本
+        彻底解决：
+        1. 遇到颜色标注后后续内容被丢弃的 Bug
+        2. 字体颜色与背景底色无法导出的问题
+        3. 超链接丢失的问题
+        """
+        line_parts = []
+
+        # 1. 如果当前节点开头就有自身文本
+        if element.text:
+            line_parts.append(element.text)
+
+        # 2. 连续遍历所有子节点
+        for child in list(element):
+            tag_name = child.tag.replace("{http://note.youdao.com}", "").lower()
+            child_text = child.text if child.text else ""
+
+            # 提取可能存在的超链接属性
+            href = (
+                child.attrib.get("href")
+                or child.attrib.get("url")
+                or child.attrib.get("resource")
+            )
+
+            # 提取可能存在的颜色属性
+            color = (
+                child.attrib.get("color")
+                or child.attrib.get("fc")
+                or child.attrib.get("font-color")
+            )
+            # 提取可能存在的背景底色属性
+            bgcolor = (
+                child.attrib.get("bgcolor")
+                or child.attrib.get("bc")
+                or child.attrib.get("background-color")
+                or child.attrib.get("highlight")
+            )
+
+            # A. 处理超链接
+            if href or tag_name in ["a", "link", "hyperlink", "url"]:
+                link_url = href if href else child_text
+                display_text = child_text if child_text else link_url
+                part = f"[{display_text}]({link_url})"
+            else:
+                part = child_text
+
+                # B. 处理文字样式（粗体、斜体、删除线）
+                is_bold = child.attrib.get("bold") == "true" or child.attrib.get("b") == "true" or tag_name == "b"
+                is_italic = child.attrib.get("italic") == "true" or child.attrib.get("i") == "true" or tag_name == "i"
+                is_strike = child.attrib.get("strike") == "true" or child.attrib.get("s") == "true" or tag_name in ["s", "strike"]
+
+                if is_strike:
+                    part = f"~~{part}~~"
+                if is_bold and is_italic:
+                    part = f"***{part}***"
+                elif is_bold:
+                    part = f"**{part}**"
+                elif is_italic:
+                    part = f"*{part}*"
+
+                # C. 处理背景高亮底色 (黄色底色等) -> 转换为 Obsidian/Typora 通用的 ==高亮==
+                if bgcolor or "highlight" in tag_name or tag_name == "mark":
+                    part = f"=={part}=="
+
+                # D. 处理字体颜色 (红色字体等) -> 转换为兼容 HTML font 标签
+                if color and part:
+                    part = f'<font color="{color}">{part}</font>'
+
+            line_parts.append(part)
+
+            # 3. 关键点：必须提取 child 标签后的尾随文本 (tail)
+            # 否则标签后面的所有文字都会被截断丢失！
+            if child.tail:
+                line_parts.append(child.tail)
+
+        return "".join(line_parts).strip()
+
+    @staticmethod
     def convert_para_func(**kwargs):
-        """正常文本（粗体、斜体、删除线、链接）"""
-        return kwargs.get("text")
+        """正常段落文本（支持颜色、底色高亮、粗体、斜体、超链接）"""
+        return kwargs.get("text", "")
 
     @staticmethod
     def convert_heading_func(**kwargs):
         """标题"""
-        level = kwargs.get("element").attrib.get("level", 0)
-        level = 1 if level in (["a", "b"]) else level
-        text = kwargs.get("text")
-        return " ".join(["#" * int(level), text]) if text else text
+        level = kwargs.get("element").attrib.get("level", 1)
+        level = 1 if str(level).lower() in ["a", "b"] else level
+        try:
+            level_num = int(level)
+        except Exception:
+            level_num = 1
+        text = kwargs.get("text", "")
+        return f"{'#' * level_num} {text}" if text else ""
 
     @staticmethod
     def convert_image_func(**kwargs):
@@ -33,7 +118,7 @@ class XmlElementConvert(object):
             list(kwargs.get("element")), "source"
         )
         return "![{text}]({image_url})".format(
-            text=kwargs.get("text"), image_url=image_url
+            text=kwargs.get("text", ""), image_url=image_url
         )
 
     @staticmethod
@@ -53,18 +138,18 @@ class XmlElementConvert(object):
             list(kwargs.get("element")), "language"
         )
         return "```{language}\r\n{code}```".format(
-            language=language, code=kwargs.get("text")
+            language=language, code=kwargs.get("text", "")
         )
 
     @staticmethod
     def convert_todo_func(**kwargs):
         """to-do"""
-        return "- [ ] {text}".format(text=kwargs.get("text"))
+        return "- [ ] {text}".format(text=kwargs.get("text", ""))
 
     @staticmethod
     def convert_quote_func(**kwargs):
         """引用"""
-        return "> {text}".format(text=kwargs.get("text"))
+        return "> {text}".format(text=kwargs.get("text", ""))
 
     @staticmethod
     def convert_horizontal_line_func(**kwargs):
@@ -74,63 +159,64 @@ class XmlElementConvert(object):
     @staticmethod
     def convert_list_item_func(**kwargs):
         """列表"""
-        list_id = kwargs.get("element").attrib["list-id"]
-        is_ordered = kwargs.get("list_item").get(list_id)
-        text = kwargs.get("text")
-        if is_ordered == "unordered":
-            return "- {text}".format(text=text)
-        elif is_ordered == "ordered":
-            return "1. {text}".format(text=text)
+        list_id = kwargs.get("element").attrib.get("list-id")
+        list_type = kwargs.get("list_item", {}).get(list_id, "unordered")
+        text = kwargs.get("text", "")
+        if list_type == "unordered":
+            return f"- {text}"
+        elif list_type == "ordered":
+            return f"1. {text}"
+        return f"- {text}"
 
     @staticmethod
     def convert_table_func(**kwargs):
-        """
-        表格转换
-        :param kwargs:
-        :return:
-        """
+        """表格转换"""
         element = kwargs.get("element")
         content = XmlElementConvert.get_text_by_key(element, "content")
+        if not content:
+            return ""
 
-        table_data_str = f""  # f-string 多行字符串
-        nl = "\r\n"  # 考虑 Windows 系统，换行符设为 \r\n
-        table_data = json.loads(content)
-        table_data_len = len(table_data["widths"])
+        nl = "\r\n"
+        try:
+            table_data = json.loads(content)
+        except Exception:
+            return ""
+
+        table_data_len = len(table_data.get("widths", []))
+        if table_data_len == 0:
+            return ""
+
         table_data_arr = []
         table_data_line = []
 
-        for cells in table_data["cells"]:
-            values = cells.get("value")
+        for cells in table_data.get("cells", []):
+            values = cells.get("value", "")
             if values is None:
                 values = ""
-            cell_value = XmlElementConvert._encode_string_to_md(values)
+            cell_value = XmlElementConvert._encode_string_to_md(str(values))
             table_data_line.append(cell_value)
-            # 攒齐一行放到 table_data_arr 中，并重置 table_data_line
             if len(table_data_line) == table_data_len:
                 table_data_arr.append(table_data_line)
                 table_data_line = []
 
-        # 如果只有一行，那就给他加一个空白 title 行
         if len(table_data_arr) == 1:
-            table_data_arr.insert(0, [ch for ch in (" " * table_data_len)])
-            table_data_arr.insert(1, [ch for ch in ("-" * table_data_len)])
+            table_data_arr.insert(0, [" " for _ in range(table_data_len)])
+            table_data_arr.insert(1, ["-" for _ in range(table_data_len)])
         elif len(table_data_arr) > 1:
-            table_data_arr.insert(1, [ch for ch in ("-" * table_data_len)])
+            table_data_arr.insert(1, ["-" for _ in range(table_data_len)])
 
+        table_data_str = ""
         for table_line in table_data_arr:
             table_data_str += "|"
-            for table_data in table_line:
-                table_data_str += f" %s |" % table_data
-            table_data_str += f"{nl}"
+            for td in table_line:
+                table_data_str += f" {td} |"
+            table_data_str += nl
 
         return table_data_str
 
     @staticmethod
     def get_text_by_key(element_children, key="text"):
-        """
-        获取文本内容
-        :return:
-        """
+        """获取指定 key 的文本内容"""
         for sub_element in element_children:
             if key in sub_element.tag:
                 return sub_element.text if sub_element.text else ""
@@ -139,204 +225,206 @@ class XmlElementConvert(object):
     @staticmethod
     def _encode_string_to_md(original_text):
         """将字符串转义防止 markdown 识别错误"""
-        if len(original_text) <= 0 or original_text == " ":
+        if not original_text or original_text == " ":
             return original_text
 
-        original_text = original_text.replace("\\", "\\\\")  # \\ 反斜杠
-        original_text = original_text.replace("*", "\\*")  # \* 星号
-        original_text = original_text.replace("_", "\\_")  # \_ 下划线
-        original_text = original_text.replace("#", "\\#")  # \# 井号
-
-        # markdown 中需要转义的字符
+        original_text = original_text.replace("\\", "\\\\")
+        original_text = original_text.replace("*", "\\*")
+        original_text = original_text.replace("_", "\\_")
+        original_text = original_text.replace("#", "\\#")
         original_text = original_text.replace("&", "&amp;")
         original_text = original_text.replace("<", "&lt;")
         original_text = original_text.replace(">", "&gt;")
         original_text = original_text.replace("“", "&quot;")
         original_text = original_text.replace("‘", "&apos;")
-
         original_text = original_text.replace("\t", "&emsp;")
-
-        # 换行 <br>
         original_text = original_text.replace("\r\n", "<br>")
         original_text = original_text.replace("\n\r", "<br>")
         original_text = original_text.replace("\r", "<br>")
         original_text = original_text.replace("\n", "<br>")
-
         return original_text
 
 
 class JsonConvert(object):
     """
-    json 转换规则
+    JSON 转换规则
     """
 
-    def _get_common_text(self, content: dict) -> Tuple[list, str]:
-        """获取通常文本
-        :return
-            text(text): 文本内容
+    def _convert_text_attribute(self, text: str, text_attrs: list) -> str:
         """
-        all_text = ""
-        # 5 内容
-        five_contents = content.get("5")
-        # 判断是否是普通文本
-        if five_contents:
-            seven_contents = five_contents[0].get("7")
-            if not seven_contents:
-                return all_text
-            for seven_content in seven_contents:
-                # 8 文本
-                text = seven_content.get("8")
-                # 9 文本属性
-                text_attrs = seven_content.get("9")
-                if text and text_attrs:
-                    text = self._convert_text_attribute(text, text_attrs)
-                all_text += text
-        return all_text
+        转换文本属性：支持加粗、斜体、删除线、下划线、字体颜色以及背景底色高亮
+        """
+        if not isinstance(text_attrs, list) or not text_attrs or not text:
+            return text
 
-    def _convert_text_attribute(self, text: str, text_attrs: list):
-        """文本属性"""
+        for attr in text_attrs:
+            attr_type = str(attr.get("2", ""))
+            attr_val = str(attr.get("3", "")).strip()
 
-        if isinstance(text_attrs, list) and text_attrs and text:
-            for attr in text_attrs:
-                if attr["2"] == "b":
-                    # 粗体
-                    text = f"**{text}**"
-                elif attr["2"] == "i":
-                    # 斜体
-                    text = f"*{text}*"
+            # 1. 基础样式
+            if attr_type == "b":
+                text = f"**{text}**"
+            elif attr_type == "i":
+                text = f"*{text}*"
+            elif attr_type in ["s", "st", "d"]:
+                text = f"~~{text}~~"
+            elif attr_type == "u":
+                text = f"<u>{text}</u>"
+
+            # 2. 背景高亮底色 (例如黄色底色) -> 转换为 ==高亮==
+            elif attr_type in ["bc", "bg", "hl"]:
+                text = f"=={text}=="
+
+            # 3. 字体颜色 (例如红色字体) -> 转换为 HTML font
+            elif attr_type in ["fc", "c", "color"] and attr_val:
+                text = f'<font color="{attr_val}">{text}</font>'
 
         return text
 
-    def convert_text_func(self, content) -> str:
-        """正常文本、粗体、斜体、删除线、链接"""
+    def _parse_rich_inline_content(self, block: dict) -> str:
+        """
+        全量递归提取块内的所有行内富文本
+        彻底解决：
+        1. 原代码写死 five_contents[0] 导致的颜色变色后文字截断
+        2. 列表、引用、表格等丢失超链接与样式
+        """
         all_text = ""
-        one_five_contents = content.get("5")
-        if one_five_contents:
-            for one_five_content in one_five_contents:
-                # 包含 6 和 7
-                two_five_contents = one_five_content.get("5")
-                # 文本类型
-                text_type = one_five_content.get("6")
-                # 文本和属性
-                seven_contents = one_five_content.get("7")
+        items = block.get("5", [])
+        if not items:
+            return all_text
 
-                # 获取文本和属性
-                if seven_contents and not two_five_contents:
-                    text = ""
-                    for seven_content in seven_contents:
-                        # 8 文本
-                        raw = seven_content.get("8")
-                        # 9 文本属性
-                        text_attrs = seven_content.get("9")
-                        if raw and text_attrs:
-                            raw = self._convert_text_attribute(raw, text_attrs)
-                        text += raw
+        for item in items:
+            text_type = item.get("6")
+            sub_five = item.get("5")
+            seven_contents = item.get("7")
 
-                # 链接类型
-                elif text_type == "li" and two_five_contents:
-                    source_text = self._get_common_text(one_five_content)
-                    # 附加信息
-                    four_contents = one_five_content.get("4")
-                    if four_contents:
-                        hf = four_contents.get("hf")
-                        text = f"[{source_text}]({hf})"
-                    else:
-                        text = ""
+            # A. 超链接类型 (6 == "li")
+            if text_type == "li":
+                link_url = item.get("4", {}).get("hf", "")
+                link_text = ""
+                if sub_five:
+                    link_text = self._parse_rich_inline_content(item)
+                elif seven_contents:
+                    for sc in seven_contents:
+                        raw = sc.get("8", "")
+                        attrs = sc.get("9")
+                        if attrs:
+                            raw = self._convert_text_attribute(raw, attrs)
+                        link_text += raw
+
+                if link_url:
+                    all_text += f"[{link_text or link_url}]({link_url})"
                 else:
-                    text = ""
-                if text:
-                    all_text += text
+                    all_text += link_text
+
+            # B. 普通带样式的文本段 (7 包含 8文字 和 9属性)
+            elif seven_contents:
+                for sc in seven_contents:
+                    raw = sc.get("8", "")
+                    attrs = sc.get("9")
+                    if raw and attrs:
+                        raw = self._convert_text_attribute(raw, attrs)
+                    all_text += raw
+
+            # C. 嵌套结构递归提取（遍历所有子项，杜绝截断）
+            elif sub_five:
+                all_text += self._parse_rich_inline_content(item)
+
         return all_text
+
+    def _get_common_text(self, content: dict) -> str:
+        """获取普通行内文本（现已完整支持颜色、底色、超链接与样式）"""
+        return self._parse_rich_inline_content(content)
+
+    def convert_text_func(self, content) -> str:
+        """正常段落文本"""
+        return self._parse_rich_inline_content(content)
 
     def convert_h_func(self, content) -> str:
         """标题"""
-        type_name = content.get("4").get("l")
-        text = self._get_common_text(content=content)
+        type_name = content.get("4", {}).get("l", "h1")
+        text = self._parse_rich_inline_content(content)
         if text and type_name:
             level_str = type_name.replace("h", "")
-            level = int(level_str)
-            text = " ".join(["#" * int(level), text])
+            try:
+                level = int(level_str)
+            except Exception:
+                level = 1
+            return f"{'#' * level} {text}"
         return text
 
     def convert_im_func(self, content):
         """图片"""
-        image_url = content["4"]["u"]
-        return "![]({image_url})".format(image_url=image_url)
+        image_url = content.get("4", {}).get("u", "")
+        return f"![]({image_url})"
 
     def convert_a_func(self, content):
         """附件"""
-        fn = content["4"]["fn"]
-        fl = content["4"]["re"]
-        return "[{text}]({resource_url})".format(text=fn, resource_url=fl)
+        fn = content.get("4", {}).get("fn", "")
+        fl = content.get("4", {}).get("re", "")
+        return f"[{fn}]({fl})"
 
     def convert_cd_func(self, content):
         """代码块"""
-        language = content.get("4").get("la")
-        codes: list = content.get("5")
+        language = content.get("4", {}).get("la", "")
+        codes: list = content.get("5", [])
         code_block = ""
         for code in codes:
             text = self._get_common_text(code)
             code_block += text + "\n"
 
-        return "```{language}\r\n{code_block}```".format(
-            language=language, code_block=code_block
-        )
+        return f"```{language}\r\n{code_block}```"
 
     def convert_la_func(self, content):
         """高亮块"""
-        lines: list = content.get("5")
+        lines: list = content.get("5", [])
         highlight_block = ""
         for line in lines:
             text = self._get_common_text(line)
             highlight_block += text + "\n"
 
-        return "```\r\n{highlight_block}```".format(highlight_block=highlight_block)
+        return f"```\r\n{highlight_block}```"
 
     def convert_q_func(self, content):
-        """引用"""
-        q_text_list = content["5"]
+        """引用（支持内部带样式与链接）"""
+        q_text_list = content.get("5", [])
         text = ""
         for q_text_dict in q_text_list:
-            q_text = self._get_common_text(q_text_dict)
-            # 去除第一行的换行
+            q_text = self._parse_rich_inline_content(q_text_dict)
             q_text = q_text.replace("\n", "")
-            text += "> {q_text}\n".format(q_text=q_text)
+            text += f"> {q_text}\n"
         return text
 
     def convert_l_func(self, content):
-        """有序列表和无序列表，有序列表转成无序列表"""
-        text = self._get_common_text(content=content)
-        is_ordered = content.get("4").get("lt")
+        """有序列表和无序列表（支持列表内部颜色与超链接）"""
+        text = self._parse_rich_inline_content(content)
+        is_ordered = content.get("4", {}).get("lt", "unordered")
+        level = content.get("4", {}).get("ll", 1)
+        indent = "\t" * max(0, level - 1)
         if is_ordered == "unordered":
-            level = content.get("4").get("ll")
-            return "\t" * (level - 1) + "- {text}".format(text=text)
-        elif is_ordered == "ordered":
-            # 有序列表都设置为 1，有些 MD 编辑自动转为有序列表
-            return "1. {text}".format(text=text)
+            return f"{indent}- {text}"
+        else:
+            return f"{indent}1. {text}"
 
     def convert_t_func(self, content):
-        """
-        表格转换
-        """
-        nl = "\r\n"  # 考虑 Windows 系统，换行符设为 \r\n
-        tr_list = content["5"]
+        """表格转换（支持单元格内部颜色与超链接）"""
+        nl = "\r\n"
+        tr_list = content.get("5", [])
         table_lines = ""
 
         for index, tc in enumerate(tr_list):
-            table_content_list = tc["5"]
+            table_content_list = tc.get("5", [])
             table_content_len = len(table_content_list)
             if index == 1:
                 table_line = "| -- " * table_content_len + "|\n| "
             else:
                 table_line = "| "
             for table_content in table_content_list:
-                table_text_list = table_content.get("5")[0].get("5")[0].get("7")
-                if table_text_list:
-                    table_text = table_text_list[0]["8"]
-                else:
+                table_text = self._parse_rich_inline_content(table_content)
+                if not table_text.strip():
                     table_text = " "
                 table_line = table_line + table_text + " | "
-            table_lines = table_lines + table_line + f"{nl}"
+            table_lines = table_lines + table_line + nl
         return table_lines
 
 
@@ -347,108 +435,82 @@ class YoudaoNoteConvert(object):
 
     @staticmethod
     def _insert_timestamps_to_file(file_path, create_time, modify_time):
-        """
-        在文件开头插入创建时间和更新时间
-        :param file_path: 文件路径
-        :param create_time: 创建时间戳
-        :param modify_time: 更新时间戳
-        :return:
-        """
-        # 读取现有内容
+        """在文件开头插入创建时间和更新时间"""
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
-        
-        # 格式化时间
-        create_time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M:%S')
-        modify_time_str = datetime.fromtimestamp(modify_time).strftime('%Y-%m-%d %H:%M:%S')
-        
-        # 在内容开头插入时间信息
+
+        create_time_str = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d %H:%M:%S")
+        modify_time_str = datetime.fromtimestamp(modify_time).strftime("%Y-%m-%d %H:%M:%S")
+
         timestamp_header = f"创建时间: {create_time_str}\r\n更新时间: {modify_time_str}\r\n\r\n"
         new_content = timestamp_header + content
-        
-        # 写回文件
+
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
     @staticmethod
     def covert_html_to_markdown(file_path, insert_timestamps=False, create_time=None, modify_time=None):
-        """
-        转换 HTML 为 MarkDown
-        :param file_path:
-        :param insert_timestamps: 是否插入时间戳
-        :param create_time: 创建时间戳
-        :param modify_time: 更新时间戳
-        :return:
-        """
+        """转换 HTML 为 Markdown"""
         with open(file_path, "rb") as f:
             content_str = f.read().decode("utf-8")
         from markdownify import markdownify as md
 
-        # 预处理 HTML，确保换行符不会丢失
-        # 为 <div>、</div> 和 <br> 标签添加换行标记
-        content_str = content_str.replace('<div>', '\n<div>')
-        content_str = content_str.replace('</div>', '</div>\n')
-        content_str = content_str.replace('<br>', '<br>\n')
-        content_str = content_str.replace('<br/>', '<br/>\n')
-        content_str = content_str.replace('<br />', '<br />\n')
-        
+        # 换行预处理
+        content_str = content_str.replace("<div>", "\n<div>")
+        content_str = content_str.replace("</div>", "</div>\n")
+        content_str = content_str.replace("<br>", "<br>\n")
+        content_str = content_str.replace("<br/>", "<br/>\n")
+        content_str = content_str.replace("<br />", "<br />\n")
+
         new_content = md(content_str).strip()
-        
-        # 清理多余的空行（超过2个连续换行符的情况）
-        import re
-        new_content = re.sub(r'\n{3,}', '\n\n', new_content)
-        
+        new_content = re.sub(r"\n{3,}", "\n\n", new_content)
+
         base = os.path.splitext(file_path)[0]
         new_file_path = "".join([base, MARKDOWN_SUFFIX])
         os.rename(file_path, new_file_path)
         with open(new_file_path, "wb") as f:
-            f.write(new_content.encode())
-        
-        # 如果需要插入时间戳，添加到文件开头
+            f.write(new_content.encode("utf-8"))
+
         if insert_timestamps and create_time and modify_time:
             YoudaoNoteConvert._insert_timestamps_to_file(new_file_path, create_time, modify_time)
 
     @staticmethod
     def _covert_xml_to_markdown_content(file_path):
-        # 使用 xml.etree.ElementTree 将 xml 文件转换为对象
         element_tree = ET.parse(file_path)
-        note_element = element_tree.getroot()  # note Element
+        note_element = element_tree.getroot()
 
-        # list_item 的 id 与 type 的对应
         list_item = {}
         for child in note_element[0]:
             if "list" in child.tag:
-                list_item[child.attrib["id"]] = child.attrib["type"]
+                list_item[child.attrib.get("id")] = child.attrib.get("type", "unordered")
 
-        body_element = note_element[1]  # Element
+        body_element = note_element[1]
         new_content_list = []
         for element in list(body_element):
-            text = XmlElementConvert.get_text_by_key(list(element))
             name = element.tag.replace("{http://note.youdao.com}", "").replace("-", "_")
+
+            # 优先使用富文本连续流式解析器，确保颜色标签后的文字不被截断丢弃
+            text = XmlElementConvert.parse_element_rich_text(element)
+
             convert_func = getattr(
                 XmlElementConvert, "convert_{}_func".format(name), None
             )
-            # 如果没有转换，只保留文字
             if not convert_func:
-                new_content_list.append(text)
+                if text:
+                    new_content_list.append(text)
                 continue
+
             line_content = convert_func(text=text, element=element, list_item=list_item)
-            new_content_list.append(line_content)
-        return f"\r\n\r\n".join(new_content_list)  # 换行 1 行
+            if line_content:
+                new_content_list.append(line_content)
+
+        return "\r\n\r\n".join(new_content_list)
 
     @staticmethod
     def covert_xml_to_markdown(file_path, insert_timestamps=False, create_time=None, modify_time=None) -> bool:
-        """
-        转换 XML 为 MarkDown
-        :param file_path:
-        :param insert_timestamps: 是否插入时间戳
-        :param create_time: 创建时间戳
-        :param modify_time: 更新时间戳
-        :return:
-        """
+        """转换 XML 为 Markdown"""
         base = os.path.splitext(file_path)[0]
         new_file_path = "".join([base, MARKDOWN_SUFFIX])
-        # 如果文件为空，结束
         if os.path.getsize(file_path) == 0:
             os.rename(file_path, new_file_path)
             return False
@@ -457,17 +519,15 @@ class YoudaoNoteConvert(object):
         os.rename(file_path, new_file_path)
         with open(new_file_path, "wb") as f:
             f.write(new_content.encode("utf-8"))
-        
-        # 如果需要插入时间戳，添加到文件开头
+
         if insert_timestamps and create_time and modify_time:
             YoudaoNoteConvert._insert_timestamps_to_file(new_file_path, create_time, modify_time)
-        
+
         return True
 
     @staticmethod
     def _covert_json_to_markdown_content(file_path):
         new_content_list = []
-        # 加载 json 文件
         with open(file_path, "r", encoding="utf-8") as f:
             try:
                 json_data = json.load(f)
@@ -475,52 +535,41 @@ class YoudaoNoteConvert(object):
                 logging.error(e)
                 json_data = {}
 
-        json_contents = json_data["5"]  # 3 代表 id，4 代表信息，5 代表内容，6 代表类型
+        json_contents = json_data.get("5", [])
+        converter = JsonConvert()
         for content in json_contents:
-            type = content.get("6")
-            # 根据类型处理，无类型的为普通文本
-            if type:
-                convert_func = getattr(
-                    JsonConvert(), "convert_{}_func".format(type), None
-                )
-                # 如果类型没有对应转换函数，只保留文字
+            item_type = content.get("6")
+            if item_type:
+                convert_func = getattr(converter, f"convert_{item_type}_func", None)
                 if not convert_func:
-                    line_content = JsonConvert().convert_text_func(content)
+                    line_content = converter.convert_text_func(content)
                 else:
                     line_content = convert_func(content)
             else:
-                line_content = JsonConvert().convert_text_func(content)
+                line_content = converter.convert_text_func(content)
 
-            # 判断是否有内容
             if line_content:
                 new_content_list.append(line_content)
-        return f"\r\n\r\n".join(new_content_list)  # 换行 1 行
+
+        return "\r\n\r\n".join(new_content_list)
 
     @staticmethod
     def covert_json_to_markdown(file_path, insert_timestamps=False, create_time=None, modify_time=None) -> str:
-        """
-        转换 Json 为 MarkDown
-        :param file_path:
-        :param insert_timestamps: 是否插入时间戳
-        :param create_time: 创建时间戳
-        :param modify_time: 更新时间戳
-        :return:
-        """
+        """转换 JSON 为 Markdown"""
         base = os.path.splitext(file_path)[0]
         new_file_path = "".join([base, MARKDOWN_SUFFIX])
-        # 如果文件为空，结束
         if os.path.getsize(file_path) == 0:
             os.rename(file_path, new_file_path)
             return False
+
         new_content = YoudaoNoteConvert._covert_json_to_markdown_content(file_path)
         with open(new_file_path, "wb") as f:
             f.write(new_content.encode("utf-8"))
-        # 删除旧文件
+
         if os.path.exists(file_path):
             os.remove(file_path)
-        
-        # 如果需要插入时间戳，添加到文件开头
+
         if insert_timestamps and create_time and modify_time:
             YoudaoNoteConvert._insert_timestamps_to_file(new_file_path, create_time, modify_time)
-        
+
         return new_file_path
