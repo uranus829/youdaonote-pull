@@ -11,43 +11,49 @@ MARKDOWN_SUFFIX = ".md"
 
 class XmlElementConvert(object):
     """
-    XML Element 转换规则
+    XML Element 转换规则（深度加固版：兼顾老旧笔记兼容性与 Obsidian 渲染体验）
     """
+
+    @staticmethod
+    def _clean_tag(tag: str) -> str:
+        """剥离 XML 命名空间，避免老笔记命名空间变体导致解析失败"""
+        if "}" in tag:
+            tag = tag.split("}", 1)[1]
+        return tag.replace("-", "_").lower()
 
     @staticmethod
     def parse_element_rich_text(element) -> str:
         """
         深度解析 XML 节点中的富文本
-        彻底解决：
-        1. 遇到颜色标注后后续内容被丢弃的 Bug
-        2. 字体颜色与背景底色无法导出的问题
-        3. 超链接丢失的问题
+        解决：
+        1. 标签后半截截断与尾随文本 tail 丢失
+        2. 字体颜色、黄色底色导出
+        3. 超链接丢失
         """
         line_parts = []
 
-        # 1. 如果当前节点开头就有自身文本
+        # 1. 当前节点开头的文本
         if element.text:
             line_parts.append(element.text)
 
         # 2. 连续遍历所有子节点
         for child in list(element):
-            tag_name = child.tag.replace("{http://note.youdao.com}", "").lower()
+            tag_name = XmlElementConvert._clean_tag(child.tag)
             child_text = child.text if child.text else ""
 
-            # 提取可能存在的超链接属性
+            # 提取超链接属性
             href = (
                 child.attrib.get("href")
                 or child.attrib.get("url")
                 or child.attrib.get("resource")
             )
 
-            # 提取可能存在的颜色属性
+            # 提取颜色与高亮底色
             color = (
                 child.attrib.get("color")
                 or child.attrib.get("fc")
                 or child.attrib.get("font-color")
             )
-            # 提取可能存在的背景底色属性
             bgcolor = (
                 child.attrib.get("bgcolor")
                 or child.attrib.get("bc")
@@ -55,7 +61,7 @@ class XmlElementConvert(object):
                 or child.attrib.get("highlight")
             )
 
-            # A. 处理超链接
+            # A. 超链接处理
             if href or tag_name in ["a", "link", "hyperlink", "url"]:
                 link_url = href if href else child_text
                 display_text = child_text if child_text else link_url
@@ -63,10 +69,22 @@ class XmlElementConvert(object):
             else:
                 part = child_text
 
-                # B. 处理文字样式（粗体、斜体、删除线）
-                is_bold = child.attrib.get("bold") == "true" or child.attrib.get("b") == "true" or tag_name == "b"
-                is_italic = child.attrib.get("italic") == "true" or child.attrib.get("i") == "true" or tag_name == "i"
-                is_strike = child.attrib.get("strike") == "true" or child.attrib.get("s") == "true" or tag_name in ["s", "strike"]
+                # B. 文字样式（粗体、斜体、删除线）
+                is_bold = (
+                    child.attrib.get("bold") == "true"
+                    or child.attrib.get("b") == "true"
+                    or tag_name == "b"
+                )
+                is_italic = (
+                    child.attrib.get("italic") == "true"
+                    or child.attrib.get("i") == "true"
+                    or tag_name == "i"
+                )
+                is_strike = (
+                    child.attrib.get("strike") == "true"
+                    or child.attrib.get("s") == "true"
+                    or tag_name in ["s", "strike"]
+                )
 
                 if is_strike:
                     part = f"~~{part}~~"
@@ -77,18 +95,17 @@ class XmlElementConvert(object):
                 elif is_italic:
                     part = f"*{part}*"
 
-                # C. 处理背景高亮底色 (黄色底色等) -> 转换为 Obsidian/Typora 通用的 ==高亮==
+                # C. 背景高亮底色 -> 标准 HTML <mark> 标签，适配 Obsidian
                 if bgcolor or "highlight" in tag_name or tag_name == "mark":
-                    part = f"=={part}=="
+                    part = f"<mark>{part}</mark>"
 
-                # D. 处理字体颜色 (红色字体等) -> 转换为兼容 HTML font 标签
+                # D. 字体颜色 -> 标准 HTML font 标签
                 if color and part:
                     part = f'<font color="{color}">{part}</font>'
 
             line_parts.append(part)
 
-            # 3. 关键点：必须提取 child 标签后的尾随文本 (tail)
-            # 否则标签后面的所有文字都会被截断丢失！
+            # 3. 必须提取子节点之后的尾随文本 (tail)
             if child.tail:
                 line_parts.append(child.tail)
 
@@ -96,12 +113,18 @@ class XmlElementConvert(object):
 
     @staticmethod
     def convert_para_func(**kwargs):
-        """正常段落文本（支持颜色、底色高亮、粗体、斜体、超链接）"""
-        return kwargs.get("text", "")
+        """
+        正常段落文本：
+        自动转义行首的 '#'（如交换机命令注释），防止 Obsidian 误渲染成 H1 特大标题
+        """
+        text = kwargs.get("text", "")
+        if text.startswith("#"):
+            text = re.sub(r"^(#+)(\s+)", r"\\\1\2", text)
+        return text
 
     @staticmethod
     def convert_heading_func(**kwargs):
-        """标题"""
+        """真正的文章标题（工具栏选中的标题格式）"""
         level = kwargs.get("element").attrib.get("level", 1)
         level = 1 if str(level).lower() in ["a", "b"] else level
         try:
@@ -143,7 +166,7 @@ class XmlElementConvert(object):
 
     @staticmethod
     def convert_todo_func(**kwargs):
-        """to-do"""
+        """待办事项"""
         return "- [ ] {text}".format(text=kwargs.get("text", ""))
 
     @staticmethod
@@ -224,7 +247,7 @@ class XmlElementConvert(object):
 
     @staticmethod
     def _encode_string_to_md(original_text):
-        """将字符串转义防止 markdown 识别错误"""
+        """转义特殊字符防止破坏 Markdown 语法"""
         if not original_text or original_text == " ":
             return original_text
 
@@ -247,13 +270,11 @@ class XmlElementConvert(object):
 
 class JsonConvert(object):
     """
-    JSON 转换规则
+    JSON 转换规则（新版块状笔记）
     """
 
     def _convert_text_attribute(self, text: str, text_attrs: list) -> str:
-        """
-        转换文本属性：支持加粗、斜体、删除线、下划线、字体颜色以及背景底色高亮
-        """
+        """转换行内文本样式（粗体、斜体、删除线、下划线、颜色、高亮）"""
         if not isinstance(text_attrs, list) or not text_attrs or not text:
             return text
 
@@ -261,7 +282,6 @@ class JsonConvert(object):
             attr_type = str(attr.get("2", ""))
             attr_val = str(attr.get("3", "")).strip()
 
-            # 1. 基础样式
             if attr_type == "b":
                 text = f"**{text}**"
             elif attr_type == "i":
@@ -270,12 +290,10 @@ class JsonConvert(object):
                 text = f"~~{text}~~"
             elif attr_type == "u":
                 text = f"<u>{text}</u>"
-
-            # 2. 背景高亮底色 (例如黄色底色) -> 转换为 ==高亮==
+            # 背景高亮底色 -> 标准 HTML <mark> 标签
             elif attr_type in ["bc", "bg", "hl"]:
-                text = f"=={text}=="
-
-            # 3. 字体颜色 (例如红色字体) -> 转换为 HTML font
+                text = f"<mark>{text}</mark>"
+            # 字体颜色 -> 标准 HTML font 标签
             elif attr_type in ["fc", "c", "color"] and attr_val:
                 text = f'<font color="{attr_val}">{text}</font>'
 
@@ -283,10 +301,7 @@ class JsonConvert(object):
 
     def _parse_rich_inline_content(self, block: dict) -> str:
         """
-        全量递归提取块内的所有行内富文本
-        彻底解决：
-        1. 原代码写死 five_contents[0] 导致的颜色变色后文字截断
-        2. 列表、引用、表格等丢失超链接与样式
+        全量提取块内所有富文本片段，杜绝因切片导致的丢失
         """
         all_text = ""
         items = block.get("5", [])
@@ -298,7 +313,7 @@ class JsonConvert(object):
             sub_five = item.get("5")
             seven_contents = item.get("7")
 
-            # A. 超链接类型 (6 == "li")
+            # 超链接类型
             if text_type == "li":
                 link_url = item.get("4", {}).get("hf", "")
                 link_text = ""
@@ -317,7 +332,7 @@ class JsonConvert(object):
                 else:
                     all_text += link_text
 
-            # B. 普通带样式的文本段 (7 包含 8文字 和 9属性)
+            # 普通带样式的文字段
             elif seven_contents:
                 for sc in seven_contents:
                     raw = sc.get("8", "")
@@ -326,22 +341,27 @@ class JsonConvert(object):
                         raw = self._convert_text_attribute(raw, attrs)
                     all_text += raw
 
-            # C. 嵌套结构递归提取（遍历所有子项，杜绝截断）
+            # 递归提取嵌套元素
             elif sub_five:
                 all_text += self._parse_rich_inline_content(item)
 
         return all_text
 
     def _get_common_text(self, content: dict) -> str:
-        """获取普通行内文本（现已完整支持颜色、底色、超链接与样式）"""
         return self._parse_rich_inline_content(content)
 
     def convert_text_func(self, content) -> str:
-        """正常段落文本"""
-        return self._parse_rich_inline_content(content)
+        """
+        正常段落文本：
+        自动转义行首的 '#'（如交换机命令注释），防止 Obsidian 误渲染成 H1 特大标题
+        """
+        text = self._parse_rich_inline_content(content)
+        if text.startswith("#"):
+            text = re.sub(r"^(#+)(\s+)", r"\\\1\2", text)
+        return text
 
     def convert_h_func(self, content) -> str:
-        """标题"""
+        """真正的文章标题"""
         type_name = content.get("4", {}).get("l", "h1")
         text = self._parse_rich_inline_content(content)
         if text and type_name:
@@ -376,7 +396,7 @@ class JsonConvert(object):
         return f"```{language}\r\n{code_block}```"
 
     def convert_la_func(self, content):
-        """高亮块"""
+        """高亮代码块"""
         lines: list = content.get("5", [])
         highlight_block = ""
         for line in lines:
@@ -386,7 +406,7 @@ class JsonConvert(object):
         return f"```\r\n{highlight_block}```"
 
     def convert_q_func(self, content):
-        """引用（支持内部带样式与链接）"""
+        """引用"""
         q_text_list = content.get("5", [])
         text = ""
         for q_text_dict in q_text_list:
@@ -396,7 +416,7 @@ class JsonConvert(object):
         return text
 
     def convert_l_func(self, content):
-        """有序列表和无序列表（支持列表内部颜色与超链接）"""
+        """列表"""
         text = self._parse_rich_inline_content(content)
         is_ordered = content.get("4", {}).get("lt", "unordered")
         level = content.get("4", {}).get("ll", 1)
@@ -407,7 +427,7 @@ class JsonConvert(object):
             return f"{indent}1. {text}"
 
     def convert_t_func(self, content):
-        """表格转换（支持单元格内部颜色与超链接）"""
+        """表格"""
         nl = "\r\n"
         tr_list = content.get("5", [])
         table_lines = ""
@@ -430,7 +450,7 @@ class JsonConvert(object):
 
 class YoudaoNoteConvert(object):
     """
-    有道云笔记 note 内容转换为 markdown 内容
+    有道云笔记 note 内容转换为 markdown 内容核心调度器
     """
 
     @staticmethod
@@ -455,7 +475,6 @@ class YoudaoNoteConvert(object):
             content_str = f.read().decode("utf-8")
         from markdownify import markdownify as md
 
-        # 换行预处理
         content_str = content_str.replace("<div>", "\n<div>")
         content_str = content_str.replace("</div>", "</div>\n")
         content_str = content_str.replace("<br>", "<br>\n")
@@ -476,27 +495,40 @@ class YoudaoNoteConvert(object):
 
     @staticmethod
     def _covert_xml_to_markdown_content(file_path):
+        """
+        全面加固的老版 XML 解析：
+        未定义的未知标签不会再被直接丢弃，而是自动提取文字内容作为兜底
+        """
         element_tree = ET.parse(file_path)
         note_element = element_tree.getroot()
 
         list_item = {}
-        for child in note_element[0]:
-            if "list" in child.tag:
-                list_item[child.attrib.get("id")] = child.attrib.get("type", "unordered")
+        # 兼容性遍历元数据节点
+        if len(note_element) > 0:
+            for child in note_element[0]:
+                if "list" in child.tag:
+                    list_item[child.attrib.get("id")] = child.attrib.get("type", "unordered")
 
-        body_element = note_element[1]
+        # 获取正文内容节点
+        body_element = note_element[1] if len(note_element) > 1 else note_element
         new_content_list = []
-        for element in list(body_element):
-            name = element.tag.replace("{http://note.youdao.com}", "").replace("-", "_")
 
-            # 优先使用富文本连续流式解析器，确保颜色标签后的文字不被截断丢弃
+        for element in list(body_element):
+            name = XmlElementConvert._clean_tag(element.tag)
+
+            # 流式提取全量子节点及 tail 文本，避免颜色变化引起截断
             text = XmlElementConvert.parse_element_rich_text(element)
 
             convert_func = getattr(
-                XmlElementConvert, "convert_{}_func".format(name), None
+                XmlElementConvert, f"convert_{name}_func", None
             )
+
             if not convert_func:
+                # 关键修复：未识别的老版标签不再丢弃，将文本作为普通正文兜底保留！
                 if text:
+                    # 同样防范非标题行首 #
+                    if text.startswith("#"):
+                        text = re.sub(r"^(#+)(\s+)", r"\\\1\2", text)
                     new_content_list.append(text)
                 continue
 
