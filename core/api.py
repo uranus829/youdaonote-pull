@@ -15,7 +15,7 @@ class YoudaoNoteApi(object):
     ROOT_ID_URL = "https://note.youdao.com/yws/api/personal/file?method=getByPath&keyfrom=web&cstk={cstk}"
     DIR_MES_URL = (
         "https://note.youdao.com/yws/api/personal/file/{dir_id}?all=true&f=true&len=1000&sort=1"
-        "&isReverse=false&method=listPageByParentId&keyfrom=web&cstk={cstk}"
+        "&isReverse=false&method=listPageByParentId&keyfrom=web&cstk={cstk}&startIndex={startIndex}"
     )
     FILE_URL = (
         "https://note.youdao.com/yws/api/personal/sync?method=download&_system=macos&_systemVersion=&"
@@ -112,9 +112,9 @@ class YoudaoNoteApi(object):
 
     def get_dir_info_by_id(self, dir_id) -> dict:
         """
-        根据目录 ID 获取目录下所有文件信息
+        根据目录 ID 分页循环获取目录下所有文件信息（支持单目录超过 1000 个项目的全量获取）
         :return: {
-            'count': 3,
+            'count': 2350,
             'entries': [
                  {'fileEntry': {'id': 'test_dir_id', 'name': 'test_dir', 'dir': true, ...}},
                  {'fileEntry': {'id': 'test_note_id', 'name': 'test_note', 'dir': false, ...}}
@@ -122,8 +122,36 @@ class YoudaoNoteApi(object):
             ]
         }
         """
-        url = self.DIR_MES_URL.format(dir_id=dir_id, cstk=self.cstk)
-        return self.http_get(url).json()
+        all_entries = []
+        start_index = 0
+        page_size = 1000
+        total_count = None
+
+        while True:
+            url = self.DIR_MES_URL.format(
+                dir_id=dir_id, 
+                cstk=self.cstk, 
+                startIndex=start_index
+            )
+            res_json = self.http_get(url).json()
+
+            entries = res_json.get("entries", [])
+            all_entries.extend(entries)
+
+            if total_count is None:
+                total_count = res_json.get("count", 0)
+
+            # 如果当前页返回条数小于单页上限(1000)，或者已拿到的条目数达到/超过总数，说明已经拉完
+            if len(entries) < page_size or len(all_entries) >= total_count:
+                break
+
+            # 翻到下一页
+            start_index += len(entries)
+
+        return {
+            "count": len(all_entries),
+            "entries": all_entries
+        }
 
     def get_file_by_id(self, file_id):
         """
