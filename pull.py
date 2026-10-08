@@ -63,7 +63,6 @@ class YoudaoNotePull(object):
         :param config_path: config 文件路径
         :return: (config_dict, error_msg)
         """
-
         config_path = (
             config_path
             if config_path
@@ -77,7 +76,7 @@ class YoudaoNotePull(object):
         except:
             return (
                 {},
-                "请检查「config.json」格式是否为 utf-8 格式的 json！建议使用 Sublime 编辑「config.json」",
+                "请检查「config.json」格式是否为 utf-8 格式的 json！建议使用 VSCode/Sublime 编辑「config.json」",
             )
 
         key_list = ["local_dir", "ydnote_dir", "smms_secret_token", "is_relative_path", "insert_timestamps"]
@@ -94,16 +93,13 @@ class YoudaoNotePull(object):
         :param local_dir: 本地文件夹名（绝对路径）
         :return: local_dir, error_msg
         """
-        # 如果没有指定本地文件夹，当前目录新增 youdaonote 目录
         if not local_dir:
             add_dir = test_default_dir if test_default_dir else "youdaonote"
-            # 兼容 Windows 系统，将路径分隔符（\\）替换为 /
             local_dir = os.path.join(get_script_directory(), add_dir).replace("\\", "/")
 
-        # 如果指定的本地文件夹不存在，创建文件夹
         if not os.path.exists(local_dir):
             try:
-                os.mkdir(local_dir)
+                os.makedirs(local_dir, exist_ok=True)
             except:
                 return "", "请检查「{}」上层文件夹是否存在，并使用绝对路径！".format(local_dir)
         return local_dir, ""
@@ -117,7 +113,6 @@ class YoudaoNotePull(object):
         root_dir_info = self.youdaonote_api.get_root_dir_info_id()
         root_dir_id = root_dir_info["fileEntry"]["id"]
 
-        # 如果不指定文件夹，取根目录 ID
         if not ydnote_dir:
             return root_dir_id, ""
 
@@ -148,7 +143,7 @@ class YoudaoNotePull(object):
             return "", error_msg
         self.smms_secret_token = config_dict["smms_secret_token"]
         self.is_relative_path = config_dict["is_relative_path"]
-        self.insert_timestamps = config_dict.get("insert_timestamps", False)  # 默认为 False
+        self.insert_timestamps = config_dict.get("insert_timestamps", False)
         return self._get_ydnote_dir_id(ydnote_dir=config_dict["ydnote_dir"])
 
     def _judge_type(self, file_id, youdao_file_suffix) -> Enum:
@@ -159,7 +154,6 @@ class YoudaoNotePull(object):
         :return:
         """
         file_type = FileType.OTHER
-        # 1、如果文件是 .md 类型
         if youdao_file_suffix == MARKDOWN_SUFFIX:
             file_type = FileType.MARKDOWN
             return file_type
@@ -169,19 +163,14 @@ class YoudaoNotePull(object):
             or youdao_file_suffix == ""
         ):
             response = self.youdaonote_api.get_file_by_id(file_id)
-            # 2、如果文件以 `<?xml` 开头
             if response.content[:5] == b"<?xml":
                 file_type = FileType.XML
-            # 3、如果文件以 `{` 开头
             elif response.content.startswith(b'{"'):
                 file_type = FileType.JSON
-            # 4、如果文件内容包含 HTML 标签（早期的 .note 文件）
-            # 检查是否包含常见的 HTML 标签
             elif (b'<div' in response.content or b'<br' in response.content or 
                   b'<span' in response.content or b'<p>' in response.content or
                   b'</div>' in response.content or b'</span>' in response.content):
                 file_type = FileType.HTML
-            # 5、如果是 .note 文件但不是 XML、JSON 或 HTML，则为纯文本
             else:
                 file_type = FileType.PLAIN_TEXT
         return file_type
@@ -190,36 +179,30 @@ class YoudaoNotePull(object):
         """
         获取文件操作行为
         :param local_file_path:
-        :param modify_time:
+        :param modify_time: 有道云上的最后修改时间戳
         :return: FileActionEnum
         """
-        # 如果不存在，则下载
         if not os.path.exists(local_file_path):
             return FileActionEnum.ADD
 
-        # 如果已经存在，判断是否需要更新
-        # 如果有道云笔记文件更新时间小于本地文件时间，说明没有更新，则不下载，跳过
-        if modify_time <= os.path.getmtime(local_file_path):
+        # 精确对比时间戳（容忍 1 秒以内的浮点时间微差）
+        local_mtime = os.path.getmtime(local_file_path)
+        if modify_time <= local_mtime + 1:
             logging.info("此文件「%s」不更新，跳过", local_file_path)
             return FileActionEnum.CONTINUE
-        # 同一目录存在同名 md 和 note 文件时，后更新文件将覆盖另一个
+            
         return FileActionEnum.UPDATE
 
     def _optimize_file_name(self, name) -> str:
         """
-        优化文件名
+        优化文件名（清洗非法特殊字符）
         :param name:
         :return:
         """
-        # 替换下划线
-        regex_symbol = re.compile(r"[<]")  # 符号： <
-        # 删除特殊字符（包括制表符、换行符等控制字符）
-        del_regex_symbol = re.compile(r'[\\/":\|\*\?#>\t\r\n]')  # 符号：\ / " : | * ? # > \t \r \n
-        # 去除换行符和制表符
+        regex_symbol = re.compile(r"[<]")
+        del_regex_symbol = re.compile(r'[\\/":\|\*\?#>\t\r\n]')
         name = name.replace("\n", "").replace("\t", "").replace("\r", "")
-        # 去除首尾的空格
         name = name.strip()
-        # 替换一些特殊符号
         name = regex_symbol.sub("_", name)
         name = del_regex_symbol.sub("", name)
         return name
@@ -243,7 +226,7 @@ class YoudaoNotePull(object):
             if file_entry["dir"]:
                 sub_dir = os.path.join(local_dir, name).replace("\\", "/")
                 if not os.path.exists(sub_dir):
-                    os.mkdir(sub_dir)
+                    os.makedirs(sub_dir, exist_ok=True)
                 self.pull_dir_by_id_recursively(id, sub_dir)
             else:
                 modify_time = file_entry["modifyTimeForSort"]
@@ -254,31 +237,22 @@ class YoudaoNotePull(object):
         self, file_id, file_name, local_dir, modify_time, create_time
     ):
         """
-        新增或更新文件
+        新增或更新文件，并在下载后将本地文件属性精确对齐为有道云的时间
         :param file_id:
         :param file_name:
         :param local_dir:
-        :param modify_time:
-        :param create_time:
+        :param modify_time: 有道云修改时间戳
+        :param create_time: 有道云创建时间戳
         :return:
         """
+        # 保留干净的原生文件名，不强加日期前缀
         file_name = self._optimize_file_name(file_name)
         
-        # 根据配置决定是否将创建时间戳转换为日期格式并拼接到文件名前
-        if self.insert_timestamps:
-            create_date = datetime.fromtimestamp(create_time).strftime('%Y%m%d')
-            file_name_without_ext = os.path.splitext(file_name)[0]
-            file_name = f"{create_date}-{file_name_without_ext}{os.path.splitext(file_name)[1]}"
-        
-        youdao_file_suffix = os.path.splitext(file_name)[1]  # 笔记后缀
-        original_file_path = os.path.join(local_dir, file_name).replace(
-            "\\", "/"
-        )  # 原后缀路径
+        youdao_file_suffix = os.path.splitext(file_name)[1]
+        original_file_path = os.path.join(local_dir, file_name).replace("\\", "/")
 
-        # 所有类型文件均下载，不做处理
         file_type = self._judge_type(file_id, youdao_file_suffix)
 
-        # 「文档」类型本地文件均已 .md 结尾
         local_file_path = (
             os.path.join(
                 local_dir, "".join([os.path.splitext(file_name)[0], MARKDOWN_SUFFIX])
@@ -287,7 +261,6 @@ class YoudaoNotePull(object):
             else original_file_path
         )
 
-        # 如果有有道云笔记是「文档」类型，则提示类型
         tip = (
             "，云笔记原格式为 {}".format(file_type.name) if file_type != FileType.OTHER else ""
         )
@@ -296,8 +269,11 @@ class YoudaoNotePull(object):
         if file_action == FileActionEnum.CONTINUE:
             return
         if file_action == FileActionEnum.UPDATE:
-            # 考虑到使用 f.write() 直接覆盖原文件，在 Windows 下报错（WinError 183），先将其删除
-            os.remove(local_file_path)
+            try:
+                os.remove(local_file_path)
+            except Exception:
+                pass
+
         try:
             self._pull_file(
                 file_id,
@@ -308,18 +284,22 @@ class YoudaoNotePull(object):
                 create_time,
                 modify_time,
             )
+
+            # ----------------- 核心时间戳修改：100% 对齐有道云时间 -----------------
+            # 1. 设置文件的访问时间和最后修改时间为有道云的 modify_time
+            os.utime(local_file_path, (modify_time, modify_time))
+
+            # 2. 如果是 Windows 系统，将文件的创建时间精确还原为有道云的 create_time
+            if platform.system() == "Windows":
+                setctime(local_file_path, create_time)
+            # -------------------------------------------------------------------
+
             if file_action == FileActionEnum.CONTINUE:
                 logging.debug(
                     "{}「{}」{}".format(file_action.value, local_file_path, tip)
                 )
             else:
                 logging.info("{}「{}」{}".format(file_action.value, local_file_path, tip))
-
-            # 本地文件时间设置为有道云笔记的时间
-            if platform.system() == "Windows":
-                setctime(local_file_path, create_time)
-            else:
-                os.utime(local_file_path, (create_time, modify_time))
 
         except Exception as error:
             logging.info(
@@ -332,46 +312,36 @@ class YoudaoNotePull(object):
         self, file_id, file_path, local_file_path, file_type, youdao_file_suffix, create_time, modify_time
     ):
         """
-        下载文件
-        :param file_id:
-        :param file_path:
-        :param local_file_path: 本地
-        :param file_type:
-        :param youdao_file_suffix:
-        :param create_time: 创建时间
-        :param modify_time: 修改时间
-        :return:
+        下载并转换文件内容
         """
-        # 1、所有的都先下载
+        # 1、下载原始内容
         response = self.youdaonote_api.get_file_by_id(file_id)
         with open(file_path, "wb") as f:
-            f.write(response.content)  # response.content 本身就是字节类型
+            f.write(response.content)
 
-        # 2、如果文件是 note 类型，将其转换为 MarkDown 类型
+        # 2、转换为 Markdown 类型
         if file_type == FileType.XML:
             try:
                 YoudaoNoteConvert.covert_xml_to_markdown(file_path, self.insert_timestamps, create_time, modify_time)
             except ET.ParseError:
-                logging.info("此 note 笔记应该为 17 年以前新建，格式为 html，将转换为 Markdown ...")
+                logging.info("此 note 笔记为 17 年以前早期格式，将转换为 Markdown ...")
                 YoudaoNoteConvert.covert_html_to_markdown(file_path, self.insert_timestamps, create_time, modify_time)
             except Exception as e:
                 logging.info("note 笔记转换 MarkDown 失败，将跳过", repr(e))
         elif file_type == FileType.JSON:
             YoudaoNoteConvert.covert_json_to_markdown(file_path, self.insert_timestamps, create_time, modify_time)
         elif file_type == FileType.HTML:
-            logging.info("此 note 笔记为早期 HTML 格式，将转换为 Markdown ...")
+            logging.info("此 note 笔记为 HTML 格式，将转换为 Markdown ...")
             YoudaoNoteConvert.covert_html_to_markdown(file_path, self.insert_timestamps, create_time, modify_time)
         elif file_type == FileType.PLAIN_TEXT:
-            # 纯文本 .note 文件，直接重命名为 .md
             logging.info("此 note 笔记为纯文本格式，将重命名为 Markdown ...")
             base = os.path.splitext(file_path)[0]
             new_file_path = "".join([base, MARKDOWN_SUFFIX])
             os.rename(file_path, new_file_path)
-            # 如果需要插入时间戳，添加到文件开头
             if self.insert_timestamps:
                 YoudaoNoteConvert._insert_timestamps_to_file(new_file_path, create_time, modify_time)
 
-        # 3、迁移文本文件里面的有道云笔记图片（链接）
+        # 3、迁移正文中的有道云图片及附件资源链接
         if file_type != FileType.OTHER or youdao_file_suffix == MARKDOWN_SUFFIX:
             imagePull = ImagePull(
                 self.youdaonote_api, self.smms_secret_token, self.is_relative_path
@@ -406,7 +376,6 @@ if __name__ == "__main__":
         traceback.print_exc()
         logging.info("已终止执行")
         sys.exit(1)
-    # 链接错误等异常
     except Exception as err:
         logging.info("Cookies 可能已过期！其他错误：", format(err))
         traceback.print_exc()
