@@ -28,6 +28,7 @@ __github__ = "https//github.com/DeppWang/youdaonote-pull"
 
 REGEX_SYMBOL = re.compile(r'[\\/:\*\?"<>\|]')  # 符号：\ / : * ? " < > |
 MARKDOWN_SUFFIX = ".md"
+SYNC_MAP_FILENAME = ".sync_map.json"
 
 
 class FileType(Enum):
@@ -47,7 +48,7 @@ class FileActionEnum(Enum):
 
 class YoudaoNotePull(object):
     """
-    有道云笔记 Pull 封装
+    有道云笔记 Pull 封装（带本地 ID 映射与孤儿文件清理）
     """
 
     def __init__(self):
@@ -56,13 +57,58 @@ class YoudaoNotePull(object):
         self.smms_secret_token = None
         self.is_relative_path = None  # 是否使用相对路径
         self.insert_timestamps = None  # 是否插入时间戳
+        self.sync_map_file = None  # 映射表文件路径
+        self.sync_map = {}  # file_id -> {rel_path, modify_time, name}
+        self.synced_file_ids = set()  # 本次遍历到的有效 file_id 集合
+
+    def _load_sync_map(self):
+        """读取本地 .sync_map.json 映射索引"""
+        self.sync_map_file = os.path.join(self.root_local_dir, SYNC_MAP_FILENAME)
+        if os.path.exists(self.sync_map_file):
+            try:
+                with open(self.sync_map_file, "r", encoding="utf-8") as f:
+                    self.sync_map = json.load(f)
+                logging.info("已成功加载本地同步映射索引，共管理 %d 篇笔记", len(self.sync_map))
+            except Exception as e:
+                logging.warning("读取 .sync_map.json 失败，将重新初始化：%s", e)
+                self.sync_map = {}
+        else:
+            self.sync_map = {}
+
+    def _save_sync_map(self):
+        """保存 .sync_map.json 映射索引"""
+        if not self.sync_map_file:
+            return
+        try:
+            with open(self.sync_map_file, "w", encoding="utf-8") as f:
+                json.dump(self.sync_map, f, ensure_ascii=False, indent=2)
+            logging.info("同步映射索引已更新保存")
+        except Exception as e:
+            logging.warning("保存 .sync_map.json 失败：%s", e)
+
+    def _clean_deleted_files(self):
+        """
+        对比云端与本地映射，自动同步删除云端已废弃的笔记
+        """
+        deleted_ids = []
+        for fid, item in self.sync_map.items():
+            if fid not in self.synced_file_ids:
+                rel_path = item.get("rel_path")
+                if rel_path:
+                    abs_path = os.path.join(self.root_local_dir, rel_path).replace("\\", "/")
+                    if os.path.exists(abs_path):
+                        try:
+                            os.remove(abs_path)
+                            logging.info("检测到云端已删除该笔记，同步删除本地文件：「%s」", rel_path)
+                        except Exception as e:
+                            logging.warning("删除本地废弃文件「%s」失败: %s", rel_path, e)
+                deleted_ids.append(fid)
+
+        for fid in deleted_ids:
+            self.sync_map.pop(fid, None)
 
     def _covert_config(self, config_path=None) -> Tuple[dict, str]:
-        """
-        转换配置文件为 dict
-        :param config_path: config 文件路径
-        :return: (config_dict, error_msg)
-        """
+        """转换配置文件为 dict"""
         config_path = (
             config_path
             if config_path
@@ -73,7 +119,7 @@ class YoudaoNotePull(object):
 
         try:
             config_dict = json.loads(config_str)
-        except:
+        except Exception:
             return (
                 {},
                 "请检查「config.json」格式是否为 utf-8 格式的 json！建议使用 VSCode/Sublime 编辑「config.json」",
@@ -88,11 +134,7 @@ class YoudaoNotePull(object):
         return config_dict, ""
 
     def _check_local_dir(self, local_dir, test_default_dir=None) -> Tuple[str, str]:
-        """
-        检查本地文件夹
-        :param local_dir: 本地文件夹名（绝对路径）
-        :return: local_dir, error_msg
-        """
+        """检查本地文件夹"""
         if not local_dir:
             add_dir = test_default_dir if test_default_dir else "youdaonote"
             local_dir = os.path.join(get_script_directory(), add_dir).replace("\\", "/")
@@ -100,16 +142,12 @@ class YoudaoNotePull(object):
         if not os.path.exists(local_dir):
             try:
                 os.makedirs(local_dir, exist_ok=True)
-            except:
+            except Exception:
                 return "", "请检查「{}」上层文件夹是否存在，并使用绝对路径！".format(local_dir)
         return local_dir, ""
 
     def _get_ydnote_dir_id(self, ydnote_dir) -> Tuple[str, str]:
-        """
-        获取指定有道云笔记指定目录 ID
-        :param ydnote_dir: 指定有道云笔记指定目录
-        :return: dir_id, error_msg
-        """
+        """获取指定有道云笔记指定目录 ID"""
         root_dir_info = self.youdaonote_api.get_root_dir_info_id()
         root_dir_id = root_dir_info["fileEntry"]["id"]
 
@@ -125,10 +163,7 @@ class YoudaoNotePull(object):
         return "", "有道云笔记指定顶层目录不存在"
 
     def get_ydnote_dir_id(self) -> Tuple[str, str]:
-        """
-        获取有道云笔记根目录或指定目录 ID
-        :return:
-        """
+        """获取有道云笔记根目录或指定目录 ID"""
         config_dict, error_msg = self._covert_config()
         if error_msg:
             return "", error_msg
@@ -144,15 +179,14 @@ class YoudaoNotePull(object):
         self.smms_secret_token = config_dict["smms_secret_token"]
         self.is_relative_path = config_dict["is_relative_path"]
         self.insert_timestamps = config_dict.get("insert_timestamps", False)
+
+        # 加载本地映射缓存表
+        self._load_sync_map()
+
         return self._get_ydnote_dir_id(ydnote_dir=config_dict["ydnote_dir"])
 
     def _judge_type(self, file_id, youdao_file_suffix) -> Enum:
-        """
-        判断笔记类型
-        :param file_id:
-        :param youdao_file_suffix:
-        :return:
-        """
+        """判断笔记类型"""
         file_type = FileType.OTHER
         if youdao_file_suffix == MARKDOWN_SUFFIX:
             file_type = FileType.MARKDOWN
@@ -176,29 +210,20 @@ class YoudaoNotePull(object):
         return file_type
 
     def _get_file_action(self, local_file_path, modify_time) -> Enum:
-        """
-        获取文件操作行为
-        :param local_file_path:
-        :param modify_time: 有道云上的最后修改时间戳
-        :return: FileActionEnum
-        """
+        """获取文件操作行为（新增 / 跳过 / 更新）"""
         if not os.path.exists(local_file_path):
             return FileActionEnum.ADD
 
-        # 精确对比时间戳（容忍 1 秒以内的浮点时间微差）
         local_mtime = os.path.getmtime(local_file_path)
+        # 精确对比时间戳（允许 1 秒以内的微差）
         if modify_time <= local_mtime + 1:
             logging.info("此文件「%s」不更新，跳过", local_file_path)
             return FileActionEnum.CONTINUE
-            
+
         return FileActionEnum.UPDATE
 
     def _optimize_file_name(self, name) -> str:
-        """
-        优化文件名（清洗非法特殊字符）
-        :param name:
-        :return:
-        """
+        """优化文件名（清洗非法特殊字符）"""
         regex_symbol = re.compile(r"[<]")
         del_regex_symbol = re.compile(r'[\\/":\|\*\?#>\t\r\n]')
         name = name.replace("\n", "").replace("\t", "").replace("\r", "")
@@ -208,58 +233,68 @@ class YoudaoNotePull(object):
         return name
 
     def pull_dir_by_id_recursively(self, dir_id, local_dir):
-        """
-        根据目录 ID 循环遍历下载目录下所有文件
-        :param dir_id:
-        :param local_dir: 本地目录
-        :return: error_msg
-        """
+        """递归下载目录下所有文件"""
         dir_info = self.youdaonote_api.get_dir_info_by_id(dir_id)
         try:
             entries = dir_info["entries"]
         except KeyError:
             raise KeyError("有道云笔记修改了接口地址，此脚本暂时不能使用！请提 issue")
+
         for entry in entries:
             file_entry = entry["fileEntry"]
-            id = file_entry["id"]
+            fid = file_entry["id"]
             name = file_entry["name"]
             if file_entry["dir"]:
                 sub_dir = os.path.join(local_dir, name).replace("\\", "/")
                 if not os.path.exists(sub_dir):
                     os.makedirs(sub_dir, exist_ok=True)
-                self.pull_dir_by_id_recursively(id, sub_dir)
+                self.pull_dir_by_id_recursively(fid, sub_dir)
             else:
                 modify_time = file_entry["modifyTimeForSort"]
                 create_time = file_entry["createTimeForSort"]
-                self._add_or_update_file(id, name, local_dir, modify_time, create_time)
+                self._add_or_update_file(fid, name, local_dir, modify_time, create_time)
 
     def _add_or_update_file(
         self, file_id, file_name, local_dir, modify_time, create_time
     ):
         """
-        新增或更新文件，并在下载后将本地文件属性精确对齐为有道云的时间
-        :param file_id:
-        :param file_name:
-        :param local_dir:
-        :param modify_time: 有道云修改时间戳
-        :param create_time: 有道云创建时间戳
-        :return:
+        新增、重命名或更新文件
         """
-        # 保留干净的原生文件名，不强加日期前缀
-        file_name = self._optimize_file_name(file_name)
-        
-        youdao_file_suffix = os.path.splitext(file_name)[1]
-        original_file_path = os.path.join(local_dir, file_name).replace("\\", "/")
+        # 记录本次扫描到的有效 ID（用于后续判定孤儿文件）
+        self.synced_file_ids.add(file_id)
+
+        clean_file_name = self._optimize_file_name(file_name)
+        youdao_file_suffix = os.path.splitext(clean_file_name)[1]
+        original_file_path = os.path.join(local_dir, clean_file_name).replace("\\", "/")
 
         file_type = self._judge_type(file_id, youdao_file_suffix)
 
         local_file_path = (
             os.path.join(
-                local_dir, "".join([os.path.splitext(file_name)[0], MARKDOWN_SUFFIX])
+                local_dir, "".join([os.path.splitext(clean_file_name)[0], MARKDOWN_SUFFIX])
             ).replace("\\", "/")
             if file_type != FileType.OTHER
             else original_file_path
         )
+
+        # ----------------- 核心特性：自动检测重命名并处理 -----------------
+        current_rel_path = os.path.relpath(local_file_path, self.root_local_dir).replace("\\", "/")
+        old_info = self.sync_map.get(file_id)
+
+        if old_info:
+            old_rel_path = old_info.get("rel_path")
+            if old_rel_path and old_rel_path != current_rel_path:
+                old_abs_path = os.path.join(self.root_local_dir, old_rel_path).replace("\\", "/")
+                if os.path.exists(old_abs_path):
+                    try:
+                        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                        if os.path.exists(local_file_path):
+                            os.remove(local_file_path)
+                        os.rename(old_abs_path, local_file_path)
+                        logging.info("🎯 检测到笔记重命名，已将本地「%s」自动更名为「%s」", old_rel_path, current_rel_path)
+                    except Exception as e:
+                        logging.warning("自动重命名本地文件失败: %s", e)
+        # ----------------------------------------------------------------
 
         tip = (
             "，云笔记原格式为 {}".format(file_type.name) if file_type != FileType.OTHER else ""
@@ -267,7 +302,14 @@ class YoudaoNotePull(object):
 
         file_action = self._get_file_action(local_file_path, modify_time)
         if file_action == FileActionEnum.CONTINUE:
+            # 即使内容跳过下载，也更新映射表中的相对路径
+            self.sync_map[file_id] = {
+                "rel_path": current_rel_path,
+                "modify_time": modify_time,
+                "name": clean_file_name
+            }
             return
+
         if file_action == FileActionEnum.UPDATE:
             try:
                 os.remove(local_file_path)
@@ -286,13 +328,17 @@ class YoudaoNotePull(object):
             )
 
             # ----------------- 核心时间戳修改：100% 对齐有道云时间 -----------------
-            # 1. 设置文件的访问时间和最后修改时间为有道云的 modify_time
             os.utime(local_file_path, (modify_time, modify_time))
-
-            # 2. 如果是 Windows 系统，将文件的创建时间精确还原为有道云的 create_time
             if platform.system() == "Windows":
                 setctime(local_file_path, create_time)
             # -------------------------------------------------------------------
+
+            # 更新映射字典
+            self.sync_map[file_id] = {
+                "rel_path": current_rel_path,
+                "modify_time": modify_time,
+                "name": clean_file_name
+            }
 
             if file_action == FileActionEnum.CONTINUE:
                 logging.debug(
@@ -311,9 +357,7 @@ class YoudaoNotePull(object):
     def _pull_file(
         self, file_id, file_path, local_file_path, file_type, youdao_file_suffix, create_time, modify_time
     ):
-        """
-        下载并转换文件内容
-        """
+        """下载并转换文件内容"""
         # 1、下载原始内容
         response = self.youdaonote_api.get_file_by_id(file_id)
         with open(file_path, "wb") as f:
@@ -341,7 +385,7 @@ class YoudaoNotePull(object):
             if self.insert_timestamps:
                 YoudaoNoteConvert._insert_timestamps_to_file(new_file_path, create_time, modify_time)
 
-        # 3、迁移正文中的有道云图片及附件资源链接
+        # 3、迁移正文中的图片及附件资源链接
         if file_type != FileType.OTHER or youdao_file_suffix == MARKDOWN_SUFFIX:
             imagePull = ImagePull(
                 self.youdaonote_api, self.smms_secret_token, self.is_relative_path
@@ -364,6 +408,12 @@ if __name__ == "__main__":
         youdaonote_pull.pull_dir_by_id_recursively(
             ydnote_dir_id, youdaonote_pull.root_local_dir
         )
+
+        # ----------------- 遍历结束：清理云端已删除文件并保存索引 -----------------
+        youdaonote_pull._clean_deleted_files()
+        youdaonote_pull._save_sync_map()
+        # --------------------------------------------------------------------
+
     except requests.exceptions.ProxyError:
         logging.info(
             "请检查网络代理设置；也有可能是调用有道云笔记接口次数达到限制，请等待一段时间后重新运行脚本，若一直失败，可删除「cookies.json」后重试"
